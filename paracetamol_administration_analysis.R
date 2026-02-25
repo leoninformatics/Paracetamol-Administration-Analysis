@@ -1,11 +1,14 @@
 ####Script Details####
-## Title:       Paracetamol Administration analysis
-## Description: Production-quality script for cleaning and analysing Paracetamol administration records from Excel exports.
-## Author:      
-## Github link:      
-## Email:      lohagan@rotunda.ie
-## Date:        2026-02-24
+## Title:        Paracetamol Administration analysis
+## Description:  Analyse Paracetamol administrations, derive 24h totals and <6h repeat dosing; includes paracetamol-equivalent dosing for paracetamol-containing products (2025 list) and route extraction from clinical display.
+## Author:       Leon O'Hagan
+## Github link:  https://github.com/leoninformatics/Paracetamol-Administration-Analysis
+## Email:        lohagan@rotunda.ie
+## Date:         2026-02-25
 
+# ==============================
+# 0) CONFIG
+# ==============================
 suppressPackageStartupMessages({
   library(tidyverse)
   library(readxl)
@@ -16,334 +19,420 @@ suppressPackageStartupMessages({
   library(writexl)
 })
 
-# ==============================
-# 0) USER INPUTS / CONFIG
-# ==============================
-file_path <- "path/to/paracetamol_administrations.xlsx"
+file_path <- "N:/Pharmacy/MN CMS/MN-CMS Pharmacy Reports/Paracetamol Analysis/Paracetamol_Admins_2025_12.xlsx"
 sheet <- 1
+
 threshold_mg <- 4000
 min_interval_hours <- 6
 tz <- "Europe/Dublin"
 
-# Column mapping (set values to the source column names as they appear in Excel)
+# Column mapping (use names as they appear in the source Excel header row)
 column_map <- list(
-  patient_id = "patient_id",
-  administration_datetime = "administration_datetime",
-  dose_mg = "dose_mg",
-  medication_name = NA_character_,   # optional
-  route = NA_character_,             # optional
-  ward_location = NA_character_,     # optional
-  prescriber_order_id = NA_character_ # optional
+  patient_id = "MRN",
+  administration_datetime = "BEG_DT_TM",
+  dose = "ADMIN_DOSE",
+  dose_unit = "ADMIN_UNIT",
+  medication_name = "MEDICATION_NAME",
+  ward_location = "WARD",
+  prescriber_order_id = "ORDER_ID",
+  clinical_display_line = "CLINICAL_DISPLAY_LINE",
+  hospital = "HOSPITAL",
+  building = "BUILDING",
+  result_status = "CE_RESULT_STATUS_DISP"
 )
 
-# Output config
-output_dir <- "."
-output_prefix <- paste0("paracetamol_analysis_", format(Sys.Date(), "%Y%m%d"))
+#list of paracetamol-containing products prescribed in 2025 (authoritative)
+paracetamol_products_2025 <- c(
+  "Calpol",
+  "Calpol Fastmelts",
+  "Co-codamol 30mg/500mg effervescent tablets",
+  "Co-codamol 30mg/500mg tablets",
+  "Codipar 15mg/500mg capsules",
+  "Codipar 15mg/500mg effervescent tablets",
+  "Excedrin",
+  "Ixprim 37.5mg / 325mg effervescent tablets",
+  "Ixprim 37.5mg / 325mg tablets",
+  "Paracetamol",
+  "Paracetamol (ANES)",
+  "Paracetamol (ANES) 1 g",
+  "Paracetamol 500mg/ Codeine 8mg/ Caffeine 30mg",
+  "Paralief",
+  "Solpadeine",
+  "Solpadol 30mg/500mg caplets",
+  "Solpadol 30mg/500mg effervescent tablets",
+  "Tramadol 37.5mg / Paracetamol 325mg effervescent tablets",
+  "Tylex 30mg/500mg capsules"
+)
+
+# Optional: add extra aliases (free-text brand fragments) for broader detection
+brand_aliases <- c("calpol", "solpadeine", "solpadol", "tylex", "panadol", "tylenol", "paralief", "excedrin", "ixprim", "co-codamol", "codipar")
 
 # ==============================
-# 1) PACKAGE CHECKS (NO AUTO-INSTALL)
+# 1)REQUIRED PACKAGES (check)
 # ==============================
-required_pkgs <- c("tidyverse", "readxl", "lubridate", "janitor", "stringr", "slider", "writexl")
-missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, FUN.VALUE = logical(1), quietly = TRUE)]
-if (length(missing_pkgs) > 0) {
+required_pkgs <- c("dplyr", "readxl", "lubridate", "stringr", "slider", "writexl", "tibble")
+missing <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing) > 0) {
   stop(
-    paste0(
-      "Missing required packages: ", paste(missing_pkgs, collapse = ", "),
-      "\nPlease install them in your R environment before running this script.",
-      "\nExample: install.packages(c('", paste(missing_pkgs, collapse = "','"), "'))"
-    ),
+    "Missing packages: ", paste(missing, collapse = ", "),
+    "\nPlease install them (e.g., install.packages(...)) and re-run.",
     call. = FALSE
   )
 }
 
 # ==============================
-# 2) HELPER FUNCTIONS
+# 2) HELPERS
 # ==============================
-validate_column_mapping <- function(data, column_map) {
-  required_fields <- c("patient_id", "administration_datetime", "dose_mg")
-  missing_fields <- required_fields[!required_fields %in% names(column_map)]
-  if (length(missing_fields) > 0) {
-    stop("column_map is missing required mapping entries: ", paste(missing_fields, collapse = ", "), call. = FALSE)
-  }
-
-  required_columns <- unlist(column_map[required_fields], use.names = FALSE)
-  absent_columns <- required_columns[!required_columns %in% names(data)]
-  if (length(absent_columns) > 0) {
-    stop(
-      "The following mapped required columns were not found in the input sheet: ",
-      paste(absent_columns, collapse = ", "),
-      call. = FALSE
-    )
-  }
-
-  optional_keys <- setdiff(names(column_map), required_fields)
-  invalid_optional <- optional_keys[
-    !is.na(unlist(column_map[optional_keys])) &
-      !(unlist(column_map[optional_keys]) %in% names(data))
-  ]
-  if (length(invalid_optional) > 0) {
-    warning(
-      "Some optional mapped columns were not found and will be ignored: ",
-      paste(invalid_optional, collapse = ", "),
-      call. = FALSE
-    )
-  }
-}
-
 coalesce_to_char <- function(x) {
-  if (is.null(x)) return(rep(NA_character_, 0))
+  if (is.factor(x)) x <- as.character(x)
+  if (inherits(x, "POSIXt") || inherits(x, "Date")) return(as.character(x))
   as.character(x)
 }
 
+# Case/whitespace-insensitive column resolver.
+# Lets you map "MRN" even if the real column is "mrn" or " MRN " etc.
+resolve_col <- function(df, wanted) {
+  wanted_norm <- tolower(trimws(wanted))
+  nms <- names(df)
+  nms_norm <- tolower(trimws(nms))
+  idx <- match(wanted_norm, nms_norm)
+  if (!is.na(idx)) return(nms[idx])
+  NA_character_
+}
+
+# Robust datetime parser (handles Excel numeric datetimes, and common strings)
 parse_admin_datetime <- function(x, tz = "Europe/Dublin") {
-  if (inherits(x, "POSIXct")) {
-    return(with_tz(x, tzone = tz))
-  }
-
-  if (inherits(x, "Date")) {
-    return(as.POSIXct(x, tz = tz))
-  }
-
+  if (inherits(x, "POSIXt")) return(with_tz(x, tz))
+  if (inherits(x, "Date")) return(as.POSIXct(x, tz = tz))
+  
+  # Excel numeric datetime
   if (is.numeric(x)) {
-    # Excel serial dates (Windows origin)
+    # Excel origin (Windows): 1899-12-30
     return(as.POSIXct(x * 86400, origin = "1899-12-30", tz = tz))
   }
-
-  x_chr <- trimws(as.character(x))
-  x_chr[x_chr %in% c("", "NA", "N/A", "NULL", "null", "na")] <- NA_character_
-
-  parsed <- suppressWarnings(
-    parse_date_time(
-      x_chr,
-      orders = c(
-        "Ymd HMS", "Ymd HM", "Ymd",
-        "dmY HMS", "dmY HM", "dmY",
-        "mdY HMS", "mdY HM", "mdY",
-        "dmy HMS", "dmy HM", "dmy",
-        "mdy HMS", "mdy HM", "mdy",
-        "ymd HMS", "ymd HM", "ymd",
-        "d-b-Y HMS", "d-b-Y HM", "d-b-Y",
-        "d/b/Y HMS", "d/b/Y HM", "d/b/Y",
-        "Y-m-d H:M:S", "Y-m-d H:M", "Y-m-d",
-        "d.m.Y H:M:S", "d.m.Y H:M", "d.m.Y"
-      ),
-      tz = tz,
-      exact = FALSE,
-      quiet = TRUE
-    )
-  )
-
-  as.POSIXct(parsed, tz = tz)
+  
+  x_chr <- str_squish(as.character(x))
+  x_chr[x_chr == ""] <- NA_character_
+  
+  suppressWarnings(parse_date_time(
+    x_chr,
+    orders = c(
+      "Ymd HMS", "Ymd HM", "Ymd",
+      "dmY HMS", "dmY HM", "dmY",
+      "dmy HMS", "dmy HM", "dmy",
+      "d/b/Y HMS", "d/b/Y HM", "d/b/Y",
+      "d-b-Y HMS", "d-b-Y HM", "d-b-Y",
+      "d/m/y HMS", "d/m/y HM", "d/m/y",
+      "d-b-y HMS", "d-b-y HM", "d-b-y",
+      "d/b/y HMS", "d/b/y HM", "d/b/y",
+      "d-b-y H:M:S", "d-b-Y H:M:S",
+      "d-b-y H:M", "d-b-Y H:M"
+    ),
+    tz = tz
+  ))
 }
 
-parse_dose_to_mg <- function(x) {
-  if (is.numeric(x)) return(as.numeric(x))
-
-  x_chr <- tolower(trimws(as.character(x)))
-  x_chr[x_chr %in% c("", "na", "n/a", "null")] <- NA_character_
-
-  number <- suppressWarnings(readr::parse_number(x_chr, locale = readr::locale(decimal_mark = ".")))
-  unit <- case_when(
-    str_detect(x_chr, "\\bmcg\\b|\\bug\\b|microgram") ~ "mcg",
-    str_detect(x_chr, "\\bg\\b|gram") ~ "g",
-    str_detect(x_chr, "\\bmg\\b|milligram") ~ "mg",
-    TRUE ~ "mg" # default assumption
-  )
-
-  dose_mg <- case_when(
-    is.na(number) ~ NA_real_,
-    unit == "g" ~ number * 1000,
-    unit == "mcg" ~ number / 1000,
-    TRUE ~ number
-  )
-
-  as.numeric(dose_mg)
+# Extract route from CLINICAL_DISPLAY_LINE:
+# "DOSE: ... - ROUTE: intraVENOUS - infusion - ..."  -> "intravenous"
+extract_route_from_display <- function(x) {
+  x_chr <- as.character(x)
+  route <- str_match(x_chr, "(?i)\\broute\\s*:\\s*([^\\-]+)")[, 2]
+  route <- str_squish(route)
+  
+  # normalise common routes
+  route_lower <- tolower(route)
+  route[route_lower %in% c("intravenous", "iv", "i.v.", "intra venous", "intra-venous")] <- "intravenous"
+  route[route_lower %in% c("oral", "po", "p.o.")] <- "oral"
+  
+  route
 }
 
-build_exception_reason <- function(within_6h_flag, exceeds_24h_threshold_flag) {
-  case_when(
-    isTRUE(within_6h_flag) & isTRUE(exceeds_24h_threshold_flag) ~ "<6h since previous; exceeds 24h threshold",
-    isTRUE(within_6h_flag) ~ "<6h since previous",
-    isTRUE(exceeds_24h_threshold_flag) ~ "Exceeds rolling 24h threshold",
-    TRUE ~ NA_character_
-  )
+# Flag if any of the supplied product strings appears in medication_name (fixed match, case-insensitive via tolower)
+product_used_flag <- function(med_name, patterns_lower) {
+  med <- tolower(trimws(as.character(med_name)))
+  ifelse(is.na(med), FALSE, Reduce(`|`, lapply(patterns_lower, function(p) str_detect(med, fixed(p)))))
+}
+
+# Capture first matched product name (best-effort)
+product_used_name <- function(med_name, patterns_lower) {
+  med <- tolower(trimws(as.character(med_name)))
+  out <- rep(NA_character_, length(med))
+  for (p in patterns_lower) {
+    hit <- !is.na(med) & is.na(out) & str_detect(med, fixed(p))
+    out[hit] <- p
+  }
+  str_to_title(out)
+}
+
+# Parse paracetamol strength from medication_name if present.
+# Returns numeric mg of PARACETAMOL per unit (tablet/capsule/etc.) when detectable; else NA.
+parse_paracetamol_strength_mg <- function(med_name) {
+  med <- tolower(as.character(med_name))
+  
+  # 1) explicit "paracetamol XXX mg"
+  parac_mg <- suppressWarnings(as.numeric(str_match(med, "(?i)paracetamol\\s*([0-9]+\\.?[0-9]*)\\s*mg")[, 2]))
+  
+  # 2) explicit "paracetamol ... X g"
+  parac_g <- suppressWarnings(as.numeric(str_match(med, "(?i)paracetamol[^0-9]*([0-9]+\\.?[0-9]*)\\s*g\\b")[, 2]))
+  parac_g_mg <- ifelse(!is.na(parac_g), parac_g * 1000, NA_real_)
+  
+  # 3) fallback: take the max of all mg numbers in the string (common combos: 30mg/500mg)
+  mg_nums <- str_extract_all(med, "([0-9]+\\.?[0-9]*)\\s*mg")
+  fallback <- vapply(mg_nums, function(v) {
+    if (length(v) == 0) return(NA_real_)
+    vals <- suppressWarnings(as.numeric(str_match(v, "([0-9]+\\.?[0-9]*)")[, 2]))
+    if (all(is.na(vals))) return(NA_real_)
+    max(vals, na.rm = TRUE)
+  }, numeric(1))
+  fallback[is.infinite(fallback)] <- NA_real_
+  
+  out <- parac_mg
+  out[is.na(out)] <- parac_g_mg[is.na(out)]
+  out[is.na(out)] <- fallback[is.na(out)]
+  out
+}
+
+# Vectorised paracetamol-equivalent mg:
+# - grams -> mg
+# - if dose is a count and strength can be parsed, dose * strength_mg
+# - Solpadeine capsules override: 1 capsule = 500 mg (your rule)
+paracetamol_equiv_mg <- function(med_name, dose, unit = NA_character_) {
+  med <- tolower(trimws(as.character(med_name)))
+  unit <- tolower(trimws(as.character(unit)))
+  dose_num <- suppressWarnings(as.numeric(dose))
+  
+  out <- dose_num
+  
+  # grams -> mg
+  is_g <- !is.na(unit) & unit %in% c("g", "gram", "grams")
+  out[is_g] <- dose_num[is_g] * 1000
+  
+  # Strength-based conversion when unit indicates a count of items
+  strength_mg <- parse_paracetamol_strength_mg(med_name)
+  is_count_unit <- !is.na(unit) & str_detect(unit, "tab|tablet|cap|capsule|caplet|effervescent|fastmelt|supp|sachet|dose|unit|spray|lozenge")
+  use_strength <- !is.na(strength_mg) & !is.na(dose_num) & is_count_unit
+  out[use_strength] <- dose_num[use_strength] * strength_mg[use_strength]
+  
+  # Solpadeine capsules override (requested): 500 mg per capsule
+  is_solv_cap <- str_detect(med, "solpadeine") & !is.na(unit) & str_detect(unit, "cap")
+  out[is_solv_cap] <- dose_num[is_solv_cap] * 500
+  
+  out
 }
 
 # ==============================
 # 3) IMPORT
 # ==============================
+message("[1/7] Importing Excel...")
 if (!file.exists(file_path)) {
   stop("Input file does not exist. Update 'file_path' in the config section and rerun.", call. = FALSE)
 }
 
-message("[1/7] Reading Excel data...")
-raw <- read_excel(path = file_path, sheet = sheet) %>%
-  clean_names()
+raw <- read_excel(file_path, sheet = sheet, col_names = TRUE, .name_repair = "minimal")
+names(raw) <- trimws(names(raw))
 
-if (nrow(raw) == 0) stop("Input data has 0 rows; nothing to process.", call. = FALSE)
+message("[2/7] Resolving mapped columns and building working dataset...")
 
-# normalize column_map values to janitor::clean_names() format
-column_map <- purrr::map_chr(column_map, ~ {
-  if (is.na(.x)) return(NA_character_)
-  janitor::make_clean_names(.x)
-})
+# Resolve mapped names against actual dataframe names (case/trim-insensitive)
+resolved <- lapply(column_map, function(nm) if (is.na(nm)) NA_character_ else resolve_col(raw, nm))
 
-validate_column_mapping(raw, column_map)
+# Quick sanity check (required columns)
+required_cols <- c("patient_id", "administration_datetime", "dose")
+missing_req <- names(resolved)[is.na(resolved[names(resolved) %in% required_cols])]
+if (length(missing_req) > 0) {
+  stop(
+    "Could not resolve required columns: ", paste(missing_req, collapse = ", "),
+    "\nCheck the header row / skip parameter / column_map values.",
+    call. = FALSE
+  )
+}
 
-message("[2/7] Applying column mapping and initial selection...")
 working <- raw %>%
   transmute(
-    patient_id = .data[[column_map$patient_id]],
-    administration_datetime_raw = .data[[column_map$administration_datetime]],
-    dose_raw = .data[[column_map$dose_mg]],
-    medication_name = if (!is.na(column_map$medication_name) && column_map$medication_name %in% names(raw)) .data[[column_map$medication_name]] else NA,
-    route = if (!is.na(column_map$route) && column_map$route %in% names(raw)) .data[[column_map$route]] else NA,
-    ward_location = if (!is.na(column_map$ward_location) && column_map$ward_location %in% names(raw)) .data[[column_map$ward_location]] else NA,
-    prescriber_order_id = if (!is.na(column_map$prescriber_order_id) && column_map$prescriber_order_id %in% names(raw)) .data[[column_map$prescriber_order_id]] else NA
+    patient_id = .data[[resolved$patient_id]],
+    administration_datetime_raw = .data[[resolved$administration_datetime]],
+    dose_raw = .data[[resolved$dose]],
+    dose_unit = if (!is.na(resolved$dose_unit)) .data[[resolved$dose_unit]] else NA_character_,
+    medication_name = if (!is.na(resolved$medication_name)) .data[[resolved$medication_name]] else NA_character_,
+    ward_location = if (!is.na(resolved$ward_location)) .data[[resolved$ward_location]] else NA_character_,
+    prescriber_order_id = if (!is.na(resolved$prescriber_order_id)) .data[[resolved$prescriber_order_id]] else NA_character_,
+    clinical_display_line = if (!is.na(resolved$clinical_display_line)) .data[[resolved$clinical_display_line]] else NA_character_,
+    hospital = if (!is.na(resolved$hospital)) .data[[resolved$hospital]] else NA_character_,
+    building = if (!is.na(resolved$building)) .data[[resolved$building]] else NA_character_,
+    result_status = if (!is.na(resolved$result_status)) .data[[resolved$result_status]] else NA_character_
   )
 
-initial_n <- nrow(working)
+# ==============================
+# 3b) CLEAN BASICS
+# ==============================
+message("[2.5/7] Cleaning datetimes and basic fields...")
+
+n_before <- nrow(working)
+
+working <- working %>%
+  mutate(
+    patient_id = coalesce_to_char(patient_id),
+    medication_name = coalesce_to_char(medication_name),
+    dose_unit = coalesce_to_char(dose_unit),
+    ward_location = coalesce_to_char(ward_location),
+    prescriber_order_id = coalesce_to_char(prescriber_order_id),
+    clinical_display_line = coalesce_to_char(clinical_display_line),
+    administration_datetime = parse_admin_datetime(administration_datetime_raw, tz = tz),
+    dose_raw = coalesce_to_char(dose_raw)
+  )
+
+bad_dt <- sum(is.na(working$administration_datetime))
+message("Rows with unparseable administration datetime: ", bad_dt, " / ", n_before)
 
 # ==============================
-# 4) FILTER TO PARACETAMOL (if medication column provided)
+# 4) FILTER + ROUTE + BRAND/PRODUCT + PARACETAMOL-EQUIV DOSE
 # ==============================
-message("[3/7] Filtering to Paracetamol/Acetaminophen records (when medication_name is available)...")
-paracetamol_pattern <- regex("paracetamol|acetaminophen|aceta[min]?ophen|\\bapap\\b|calpol|panadol|tylenol", ignore_case = TRUE)
+message("[3/7] Filtering paracetamol-containing products (2025 list), extracting route, product flags, and deriving paracetamol-equivalent dose...")
 
-if (!all(is.na(working$medication_name))) {
+# Normalised patterns for product detection
+product_patterns_lower <- unique(tolower(trimws(paracetamol_products_2025)))
+alias_patterns_lower <- unique(tolower(trimws(brand_aliases)))
+
+# Generic synonym safety-net
+generic_paracetamol_pattern <- regex("paracetamol|acetaminophen|aceta[min]?ophen|\\bapap\\b", ignore_case = TRUE)
+
+# Filter if medication_name is available (and not all NA)
+if (!all(is.na(working$medication_name)) && any(nzchar(na.omit(working$medication_name)))) {
   before_med_filter <- nrow(working)
-  working <- working %>% filter(str_detect(coalesce_to_char(medication_name), paracetamol_pattern))
+  working <- working %>%
+    filter(
+      str_detect(tolower(coalesce_to_char(medication_name)), generic_paracetamol_pattern) |
+        product_used_flag(medication_name, product_patterns_lower) |
+        product_used_flag(medication_name, alias_patterns_lower)
+    )
   after_med_filter <- nrow(working)
   message("Rows kept after medication filter: ", after_med_filter, " / ", before_med_filter)
 } else {
-  message("No medication_name mapped/present; assuming source already contains only Paracetamol administrations.")
+  message("No medication_name mapped/present; assuming source already contains only paracetamol-containing administrations.")
 }
 
-# ==============================
-# 5) CLEAN DATETIME / DOSE + DATA QUALITY FILTERS
-# ==============================
-message("[4/7] Parsing administration datetime and dose...")
 working <- working %>%
   mutate(
-    patient_id = as.character(patient_id),
-    administration_datetime = parse_admin_datetime(administration_datetime_raw, tz = tz),
-    dose_mg = parse_dose_to_mg(dose_raw)
+    # Route extracted from clinical display line
+    route_extracted = if (!all(is.na(clinical_display_line))) extract_route_from_display(clinical_display_line) else NA_character_,
+    
+    # Product/brand flags based on your 2025 list (+ aliases)
+    brand_used_flag = if (!all(is.na(medication_name))) {
+      product_used_flag(medication_name, product_patterns_lower) | product_used_flag(medication_name, alias_patterns_lower)
+    } else FALSE,
+    
+    brand_used_name = if (!all(is.na(medication_name))) {
+      # Prefer an exact product match; otherwise fall back to alias capture
+      nm <- product_used_name(medication_name, product_patterns_lower)
+      nm2 <- product_used_name(medication_name, alias_patterns_lower)
+      ifelse(!is.na(nm), nm, nm2)
+    } else NA_character_,
+    
+    # Paracetamol-equivalent dose in mg (strength parsing + Solpadeine capsule override)
+    dose_mg = paracetamol_equiv_mg(medication_name, dose_raw, dose_unit)
   )
 
-missing_patient_id_n <- sum(is.na(working$patient_id) | trimws(working$patient_id) == "")
-invalid_datetime_n <- sum(is.na(working$administration_datetime))
-invalid_dose_n <- sum(is.na(working$dose_mg) | !is.finite(working$dose_mg) | working$dose_mg <= 0)
+bad_dose <- sum(is.na(working$dose_mg))
+message("Rows with unparseable dose (dose_mg is NA): ", bad_dose, " / ", nrow(working))
 
-clean_admins <- working %>%
-  filter(!(is.na(patient_id) | trimws(patient_id) == "")) %>%
+# ==============================
+# 5) DERIVED METRICS: <6h + rolling 24h total
+# ==============================
+message("[4/7] Calculating time-since-previous and rolling 24h totals...")
+
+working <- working %>%
+  filter(!is.na(patient_id) & nzchar(patient_id)) %>%
   filter(!is.na(administration_datetime)) %>%
-  filter(!is.na(dose_mg), is.finite(dose_mg), dose_mg > 0) %>%
-  arrange(patient_id, administration_datetime)
+  arrange(patient_id, administration_datetime) %>%
+  group_by(patient_id) %>%
+  mutate(
+    time_since_prev_hours = as.numeric(difftime(administration_datetime, lag(administration_datetime), units = "hours")),
+    within_6h_flag = !is.na(time_since_prev_hours) & time_since_prev_hours < min_interval_hours
+  ) %>%
+  ungroup()
 
-clean_n <- nrow(clean_admins)
-dropped_total_n <- initial_n - clean_n
-
-# ==============================
-# 6) DERIVE FLAGS + ROLLING CALCULATIONS
-# ==============================
-message("[5/7] Computing intervals, rolling 24h totals, and exception flags...")
-clean_admins <- clean_admins %>%
+# Rolling 24h total (inclusive of current administration)
+working <- working %>%
   group_by(patient_id) %>%
   arrange(administration_datetime, .by_group = TRUE) %>%
   mutate(
-    time_since_prev_hours = as.numeric(difftime(administration_datetime, lag(administration_datetime), units = "hours")),
-    within_6h_flag = !is.na(time_since_prev_hours) & time_since_prev_hours < min_interval_hours,
-    rolling_24h_total_mg = slide_index_dbl(
+    rolling_24h_window_start = administration_datetime - hours(24),
+    rolling_24h_total_mg = slider::slide_index_dbl(
       .x = dose_mg,
       .i = administration_datetime,
       .f = ~ sum(.x, na.rm = TRUE),
       .before = hours(24),
-      .after = 0,
       .complete = FALSE
     ),
-    exceeds_24h_threshold_flag = rolling_24h_total_mg > threshold_mg,
-    rolling_24h_window_start = administration_datetime - hours(24)
+    exceeds_24h_threshold_flag = !is.na(rolling_24h_total_mg) & rolling_24h_total_mg > threshold_mg
   ) %>%
-  ungroup() %>%
-  select(
-    patient_id,
-    administration_datetime,
-    dose_mg,
-    time_since_prev_hours,
-    within_6h_flag,
-    rolling_24h_total_mg,
-    exceeds_24h_threshold_flag,
-    rolling_24h_window_start,
-    medication_name,
-    route,
-    ward_location,
-    prescriber_order_id
-  )
+  ungroup()
 
-# Optional calendar-day summary
-message("[6/7] Building patient-day summary and exceptions...")
+# ==============================
+# 6) SUMMARIES + EXCEPTIONS
+# ==============================
+message("[5/7] Building summary tables and exceptions...")
+
+clean_admins <- working %>%
+  arrange(patient_id, administration_datetime)
+
 patient_day_summary <- clean_admins %>%
   mutate(calendar_date = as.Date(administration_datetime, tz = tz)) %>%
   group_by(patient_id, calendar_date) %>%
   summarise(
     total_dose_mg_calendar_day = sum(dose_mg, na.rm = TRUE),
-    max_rolling_24h_total_mg_that_day = max(rolling_24h_total_mg, na.rm = TRUE),
-    n_admins = n(),
+    max_rolling_24h_total_mg_that_day = suppressWarnings(max(rolling_24h_total_mg, na.rm = TRUE)),
+    n_admins = dplyr::n(),
     n_within_6h = sum(within_6h_flag, na.rm = TRUE),
     any_exceeds_threshold = any(exceeds_24h_threshold_flag, na.rm = TRUE),
+    any_brand_used = any(brand_used_flag, na.rm = TRUE),
     .groups = "drop"
+  ) %>%
+  mutate(
+    max_rolling_24h_total_mg_that_day = ifelse(is.infinite(max_rolling_24h_total_mg_that_day), NA_real_, max_rolling_24h_total_mg_that_day)
   )
 
 exceptions <- clean_admins %>%
   filter(within_6h_flag | exceeds_24h_threshold_flag) %>%
-  mutate(exception_reason = purrr::map2_chr(within_6h_flag, exceeds_24h_threshold_flag, build_exception_reason))
+  mutate(
+    exception_reason = case_when(
+      within_6h_flag & exceeds_24h_threshold_flag ~ paste0("<", min_interval_hours, "h since previous AND 24h total > ", threshold_mg, "mg"),
+      within_6h_flag ~ paste0("<", min_interval_hours, "h since previous dose"),
+      exceeds_24h_threshold_flag ~ paste0("Rolling 24h total > ", threshold_mg, "mg"),
+      TRUE ~ NA_character_
+    )
+  )
 
 # Data quality sheet
-date_min <- if (clean_n > 0) min(clean_admins$administration_datetime, na.rm = TRUE) else as.POSIXct(NA)
-date_max <- if (clean_n > 0) max(clean_admins$administration_datetime, na.rm = TRUE) else as.POSIXct(NA)
-
-data_quality <- tibble(
+data_quality <- tibble::tibble(
   metric = c(
-    "input_rows_initial",
-    "rows_after_cleaning",
-    "rows_dropped_total",
-    "rows_missing_or_blank_patient_id",
-    "rows_invalid_or_missing_datetime",
-    "rows_invalid_or_missing_dose",
-    "exceptions_rows",
-    "distinct_patients",
-    "analysis_timezone",
-    "analysis_threshold_mg",
-    "analysis_min_interval_hours",
-    "datetime_range_start",
-    "datetime_range_end"
+    "Rows imported",
+    "Rows after medication filter (if applied)",
+    "Rows with unparseable datetime",
+    "Rows with unparseable dose_mg",
+    "Datetime min",
+    "Datetime max",
+    "Threshold mg (rolling 24h)",
+    "Min interval hours (< flag)"
   ),
   value = c(
-    as.character(initial_n),
-    as.character(clean_n),
-    as.character(dropped_total_n),
-    as.character(missing_patient_id_n),
-    as.character(invalid_datetime_n),
-    as.character(invalid_dose_n),
-    as.character(nrow(exceptions)),
-    as.character(dplyr::n_distinct(clean_admins$patient_id)),
-    tz,
-    as.character(threshold_mg),
-    as.character(min_interval_hours),
-    as.character(date_min),
-    as.character(date_max)
+    n_before,
+    nrow(clean_admins),
+    bad_dt,
+    bad_dose,
+    as.character(suppressWarnings(min(clean_admins$administration_datetime, na.rm = TRUE))),
+    as.character(suppressWarnings(max(clean_admins$administration_datetime, na.rm = TRUE))),
+    threshold_mg,
+    min_interval_hours
   )
 )
 
 # ==============================
-# 7) EXPORT + OPTIONAL PLOTS
+# 7) EXPORT
 # ==============================
-message("[7/7] Exporting outputs to Excel and creating optional plots...")
-if (!dir.exists(output_dir)) {
-  dir.create(output_dir, recursive = TRUE)
-}
+message("[6/7] Exporting Excel workbook...")
 
-output_xlsx <- file.path(output_dir, paste0(output_prefix, ".xlsx"))
+out_path <- file.path(getwd(), paste0("Paracetamol_Admin_Analysis_", format(Sys.Date(), "%Y%m%d"), ".xlsx"))
 
 writexl::write_xlsx(
   x = list(
@@ -352,56 +441,34 @@ writexl::write_xlsx(
     exceptions = exceptions,
     data_quality = data_quality
   ),
-  path = output_xlsx
+  path = out_path
 )
 
-# Optional visual outputs
-plot1_path <- file.path(output_dir, paste0(output_prefix, "_time_since_prev_hist.png"))
-plot2_path <- file.path(output_dir, paste0(output_prefix, "_rolling24h_top5.png"))
+message("[7/7] Done. Output written to: ", out_path)
 
-if (nrow(clean_admins %>% filter(!is.na(time_since_prev_hours))) > 0) {
-  p1 <- clean_admins %>%
-    filter(!is.na(time_since_prev_hours)) %>%
-    ggplot(aes(x = time_since_prev_hours)) +
-    geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
-    geom_vline(xintercept = min_interval_hours, linetype = "dashed", color = "red") +
-    labs(
-      title = "Distribution of time since previous administration",
-      x = "Hours since previous administration",
-      y = "Count"
-    ) +
-    theme_minimal()
+# ==============================
+# (Optional) QUICK PLOTS
+# ==============================
+#If you want quick visuals, uncomment:
+if (requireNamespace("ggplot2", quietly = TRUE)) {
+  library(ggplot2)
+  ggplot(clean_admins %>% filter(!is.na(time_since_prev_hours)),
+         aes(x = time_since_prev_hours)) +
+    geom_histogram(bins = 50) +
+    labs(title = "Time since previous Paracetamol administration (hours)",
+         x = "Hours", y = "Count")
 
-  ggsave(filename = plot1_path, plot = p1, width = 10, height = 6, dpi = 300)
-}
+  top_patients <- clean_admins %>%
+    group_by(patient_id) %>%
+    summarise(max_roll = max(rolling_24h_total_mg, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(max_roll)) %>%
+    slice_head(n = 5) %>%
+    pull(patient_id)
 
-top5_patients <- clean_admins %>%
-  group_by(patient_id) %>%
-  summarise(max_rolling = max(rolling_24h_total_mg, na.rm = TRUE), .groups = "drop") %>%
-  slice_max(order_by = max_rolling, n = 5, with_ties = FALSE) %>%
-  pull(patient_id)
-
-if (length(top5_patients) > 0) {
-  p2 <- clean_admins %>%
-    filter(patient_id %in% top5_patients) %>%
-    ggplot(aes(x = administration_datetime, y = rolling_24h_total_mg, color = patient_id, group = patient_id)) +
-    geom_line(alpha = 0.8) +
-    geom_point(size = 1.2) +
-    geom_hline(yintercept = threshold_mg, linetype = "dashed", color = "red") +
+  ggplot(clean_admins %>% filter(patient_id %in% top_patients),
+         aes(x = administration_datetime, y = rolling_24h_total_mg)) +
+    geom_line() +
     facet_wrap(~ patient_id, scales = "free_x") +
-    labs(
-      title = "Rolling 24-hour total dose (Top 5 patients by max rolling total)",
-      x = "Administration datetime",
-      y = "Rolling 24h total (mg)",
-      color = "Patient"
-    ) +
-    theme_minimal() +
-    theme(legend.position = "none")
-
-  ggsave(filename = plot2_path, plot = p2, width = 12, height = 8, dpi = 300)
+    labs(title = "Rolling 24h Paracetamol total (top 5 patients)",
+         x = "Administration time", y = "Rolling 24h total (mg)")
 }
-
-message("Analysis complete.")
-message("Excel output: ", output_xlsx)
-if (file.exists(plot1_path)) message("Plot saved: ", plot1_path)
-if (file.exists(plot2_path)) message("Plot saved: ", plot2_path)
